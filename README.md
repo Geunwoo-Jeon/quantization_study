@@ -35,7 +35,7 @@
 | # | 주제 | 상태 |
 |---|------|------|
 | 01 | Weight-only vs Weight-Activation 트레이드오프 | 완료 |
-| 02 | GPTQ | |
+| 02 | GPTQ | 완료 |
 | 03 | SmoothQuant | |
 | 04 | AWQ | |
 | 05 | Block / Sub-channel Quantization | |
