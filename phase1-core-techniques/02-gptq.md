@@ -206,6 +206,143 @@ g128 = group size 128 (128개 weight마다 별도의 scale/zero_point 사용).
 | **4bit 정확도** | 매우 좋음 | 매우 좋음 (약간 우위 보고도 있음) |
 | **양자화 속도** | 빠름 (~분 단위) | 더 빠름 |
 
+## 자사 quantizer 코드베이스 구현
+
+> OPTQ = GPTQ. 원래 논문 이름이 GPTQ였으나 개정판에서 "Optimal PTQ"로 변경. 커뮤니티에서는 GPTQ가 더 널리 쓰임.
+
+### 파일 구조
+
+```
+src/quantizer/OPTQ/
+├── optqCore.h/cc      # Hessian 계산 (H = X @ X.T 점진적 누적)
+├── optqRunner.h/cc    # 레이어별 OPTQ 인스턴스 관리 및 오케스트레이션
+├── utils.h/cc         # 핵심 양자화 알고리즘 (error compensation 루프)
+└── wrapper.cc         # 모델 레벨 통합 훅
+```
+
+### 호출 스택
+
+```
+Model.quantize(calTensorList)
+│
+├─ 1) registerLayersOPTQ()                    [wrapper.cc]
+│     └─ OPTQRunner::registerLayer()          [optqRunner.cc]
+│        Config에 따라 Conv/TConv 레이어에 OPTQ 인스턴스 생성
+│
+├─ 2) 각 calibration 샘플마다:
+│     └─ Model::updateHessian()               [wrapper.cc]
+│        └─ OPTQRunner::updateHessian()       [optqRunner.cc]
+│           └─ OPTQ::addBatch(batch)          [optqCore.cc:15-57]
+│              x = unfold(x)                  # Conv: (b,c,h,w) → (c*k*k, b*L)
+│              x = x * sqrt(2/(n + batch))    # 정규화
+│              H += x @ x.t()                 # 점진적 Hessian 누적
+│
+├─ 3) adjustHessian()                         [wrapper.cc]
+│     └─ OPTQRunner::adjustHessian()          [optqRunner.cc]
+│        └─ OPTQ::adjustHessian()             [optqCore.cc]
+│           input 양자화 scale 반영 → Hessian을 레이어로 전달
+│
+└─ 4) 각 레이어에서:
+      └─ ConvolutionLayer::updateFusedWeightOPTQ()  [convolution.cc:748-750]
+         └─ updateFusedWeightOPTQ_()                [utils.cc:75-197]
+            ├─ (a) Dead neuron 처리             [utils.cc:95-100]
+            ├─ (b) Activation ordering          [utils.cc:102-109]
+            ├─ (c) Damping + Cholesky 역행렬    [utils.cc:111-141]
+            ├─ (d) 블록 단위 양자화 + error 보상  [utils.cc:143-185]
+            └─ (e) 원래 열 순서 복원             [utils.cc:186-188]
+```
+
+### 핵심 코드 매핑
+
+**Hessian 계산** (`optqCore.cc:addBatch`):
+
+```cpp
+// 논문: H = X @ X.T / n
+void OPTQ::addBatch(const at::Tensor& batch) {
+    x = torch::nn::functional::unfold(x, unfoldOption);  // Conv 지원
+    x = x * sqrt(2.0 / (mNumSamples + x.size(-1)));      // 정규화
+    auto hessianBatch = torch::matmul(x, x.t());          // H += X @ X.T
+    mHessian = mHessian * (mNumSamples / (mNumSamples + x.size(-1)))
+             + hessianBatch;                               // 가중 누적
+}
+```
+
+**양자화 + 보상 루프** (`utils.cc:updateFusedWeightOPTQ_`):
+
+```cpp
+// 논문 의사코드와 1:1 대응
+for (i = 0; i < n_cols; i += blockSize) {       // blockSize=128
+    for (j = 0; j < blockSize; j++) {
+        q = downresol(w[j], weightBits, scale);  // 양자화
+        err = (w - q) / H_inv[j][j];             // 자유도로 나눔
+        W[:, j+1:] -= err * H_inv[j, j+1:];      // 블록 내 보상
+    }
+    W[:, col_end:] -= Err @ H_inv[block, rest];   // 블록 간 보상
+}
+```
+
+### 논문 대비 자사 구현의 추가 기능
+
+#### (a) Dead Neuron 처리 (`utils.cc:95-100`)
+
+calibration 데이터에서 한 번도 활성화되지 않은 feature를 처리:
+
+```python
+dead = (diag(H) == 0)       # 한 번도 활성화 안 된 feature
+H[dead, dead] = 1.0          # Cholesky 실패 방지
+W[:, dead] = 0.0              # 활성화 안 되니 weight도 0으로
+```
+
+이게 없으면 `H[j,j] = 0` → `H_inv[j,j]` 계산 불가 → Cholesky 실패.
+
+#### (b) Activation Ordering (`utils.cc:102-109`, `actOrder=true`)
+
+열을 H 대각이 큰 순서(민감한 열 우선)로 재정렬:
+
+```python
+order = argsort(diag(H), descending=True)  # 민감한 열 먼저
+W = W[:, order]
+H = H[order][:, order]
+# ... GPTQ 양자화 ...
+W = W[:, inverse_order]                     # 원래 순서 복원
+```
+
+민감한 열을 먼저 처리하면 보상에 쓸 수 있는 나머지 열이 많아서 더 효과적. 3bit 이하에서 유의미한 개선.
+
+#### (c) Damping (`utils.cc:111-141`, `percDamp=0.01`)
+
+Hessian이 singular/ill-conditioned일 때 Cholesky 실패를 방지:
+
+```python
+damp = percDamp * mean(diag(H))   # 대각 평균의 1%
+H += damp * I                      # H' = H + λI
+```
+
+모든 feature에 약간의 독립적 활성화를 인위적으로 추가하여 역행렬을 존재하게 만듦. Cholesky 실패 시 damping을 10배 올려서 최대 3회 재시도.
+
+### 설정값 (`config.h:1084-1095`)
+
+```cpp
+struct OPTQConfig {
+    bool apply = false;       // 기본 비활성화
+    bool actOrder = true;     // activation ordering 사용
+    int blockSize = 128;      // 논문과 동일
+    double percDamp = 0.01;   // 대각 damping 1%
+    std::set<std::string> applyLayerList;    // 빈 값 = 전체 Conv/TConv
+    std::set<std::string> excludeLayerList;  // 특정 레이어 제외
+};
+```
+
+### 논문 vs 자사 구현 비교
+
+| 기능 | 논문 GPTQ | 자사 구현 |
+|------|----------|----------|
+| Activation Ordering | 없음 (후속 업데이트에서 추가) | `actOrder=true` (기본 활성화) |
+| Dead Neuron 처리 | 없음 | H 대각 0 감지 → weight 0 설정 |
+| Damping | 있음 | `percDamp=0.01`, Cholesky 실패 시 3회 재시도 |
+| 대상 레이어 | Linear | Conv/TConv (unfold로 확장) |
+| Hessian dtype | FP32 | Ampere GPU면 BF16, 아니면 FP16 |
+
 ## 우리 SDK에서의 의미
 (본인 작성 영역)
 
