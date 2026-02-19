@@ -34,7 +34,7 @@
 
 | # | 주제 | 상태 |
 |---|------|------|
-| 01 | Weight-only vs Weight-Activation 트레이드오프 | |
+| 01 | Weight-only vs Weight-Activation 트레이드오프 | 완료 |
 | 02 | GPTQ | |
 | 03 | SmoothQuant | |
 | 04 | AWQ | |
